@@ -31,10 +31,6 @@ imageList = [
     ('urn:publicid:IDN+emulab.net+image+emulab-ops//FBSD142-64-STD', 'FreeBSD 14.2'),
 ]
 
-#
-# Test
-#
-
 # Do not change these unless you change the setup scripts too.
 nfsServerName = "nfs"
 nfsLanName    = "nfsLan"
