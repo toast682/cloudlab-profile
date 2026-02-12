@@ -1,9 +1,9 @@
 """
-Universal StarRocks Profile v11 (Multiplexing Fix)
+Universal StarRocks Profile v12 (Aggressive Multiplexing)
 Features:
-- IDE Node as NFS Server
-- Multiplexing Enabled on LANs (Fixes "Mapping Failed" error)
-- CSV Dataset Inputs
+- Fixes "Mapping Failed" by forcing VLAN tagging on ALL links (LANs + Datasets)
+- Allows 4 logical connections to share 2 physical ports
+- IDE Node acts as NFS Server
 """
 
 import geni.portal as portal
@@ -75,7 +75,7 @@ pc.defineParameter(
 )
 
 # =============================================================
-# 2. DATASET PARAMETERS (CSV)
+# 2. DATASET PARAMETERS
 # =============================================================
 
 pc.defineParameter(
@@ -98,7 +98,7 @@ params = pc.bindParameters()
 request = pc.makeRequestRSpec()
 
 # =============================================================
-# 3. PARSE CSV & PREPARE SCRIPTS
+# 3. PREPARE SCRIPTS
 # =============================================================
 
 urn_list = (
@@ -116,7 +116,6 @@ if len(urn_list) != len(path_list):
 
 active_datasets = list(zip(urn_list, path_list))
 
-# Generate script arguments
 path_args = ""
 for i, (urn, mount) in enumerate(active_datasets):
     path_args += " " + mount
@@ -125,28 +124,28 @@ server_cmd = "sudo /bin/bash /local/repository/nfs-server.sh" + path_args
 client_cmd = "sudo /bin/bash /local/repository/nfs-client.sh" + path_args
 
 # =============================================================
-# 4. NETWORK SETUP (WITH MULTIPLEXING)
+# 4. NETWORK SETUP (AGGRESSIVE MULTIPLEXING)
 # =============================================================
 
-# Primary LAN
+# --- LAN 1 (Primary) ---
 lan1 = request.LAN("lan-primary")
 lan1.bandwidth = params.speedLan1 * 1000000
-# CRITICAL: These flags allow the LAN to share the physical port with the Datasets
+# FORCE SHARING: This allows LAN1 to exist on the same wire as Dataset links
 lan1.link_multiplexing = True
 lan1.vlan_tagging = True
 lan1.best_effort = True
 
-# Logic to force single link if hardware doesn't support 2
+# --- Hardware Check ---
 single_port_hardware = ["d7525", "m510"]
 actual_link_count = params.linkCount
 if params.phystype in single_port_hardware and params.linkCount > 1:
     actual_link_count = 1
 
-# Secondary LAN
+# --- LAN 2 (Secondary) ---
 if actual_link_count == 2:
     lan2 = request.LAN("lan-secondary")
     lan2.bandwidth = params.speedLan2 * 1000000
-    # Enable multiplexing here too, just in case
+    # FORCE SHARING: Also enable here to maximize mapper flexibility
     lan2.link_multiplexing = True
     lan2.vlan_tagging = True
     lan2.best_effort = True
@@ -159,8 +158,7 @@ ide = request.RawPC("ide")
 ide.hardware_type = params.phystype
 ide.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops:UBUNTU24-64-STD"
 
-# -- IDE Networking --
-# We assign IP .200 to the IDE node
+# --- IDE Interfaces (LANs) ---
 ide_if1 = ide.addInterface("if1")
 ide_if1.addAddress(
     pg.IPv4Address("10.{}.0.200".format(params.speedLan1), "255.255.255.0")
@@ -174,23 +172,30 @@ if actual_link_count == 2:
     )
     lan2.addInterface(ide_if2)
 
-# -- Attach Datasets to IDE --
-# We use the exact link settings from the example script
+# --- IDE Interfaces (Datasets) ---
 for i, (urn, mount) in enumerate(active_datasets):
+    # 1. Blockstore Node
     dsnode = request.RemoteBlockstore("dsnode-{}".format(i), mount)
     dsnode.dataset = urn
 
+    # 2. Link Object
     dslink = request.Link("dslink-{}".format(i))
+
+    # 3. CRITICAL: Enable Multiplexing BEFORE adding interfaces
+    dslink.link_multiplexing = True
+    dslink.vlan_tagging = True
+    dslink.best_effort = True
+
+    # 4. Connect Blockstore and IDE
     dslink.addInterface(dsnode.interface)
+
+    # We add a new logical interface to the IDE node.
+    # Because 'link_multiplexing=True', the mapper will stack this
+    # onto the same physical port as 'if1' or 'if2'.
     dslink.addInterface(ide.addInterface())
 
-    # Flags required to share the port with LAN1
-    dslink.best_effort = True
-    dslink.vlan_tagging = True
-    dslink.link_multiplexing = True
-
 # Start NFS Server
-ide.addService(pg.Execute(shell="bash", command=server_cmd))
+ide.addService(pg.Execute(shell="sh", command=server_cmd))
 
 # =============================================================
 # 6. CLIENT NODES
@@ -216,7 +221,7 @@ def configure_client_node(name, ip_suffix):
         lan2.addInterface(if2)
 
     # Start NFS Client
-    node.addService(pg.Execute(shell="bash", command=client_cmd))
+    node.addService(pg.Execute(shell="sh", command=client_cmd))
 
 
 # Instantiate
