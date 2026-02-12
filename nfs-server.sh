@@ -1,166 +1,82 @@
-#!/bin/sh
+#!/bin/bash
 #
-# Setup a simple NFS server exporting /nfs
+# Setup NFS server for multiple exports.
 #
-# This script is derived from Jonathan Ellithorpe's Cloudlab profile at
-# https://github.com/jdellithorpe/cloudlab-generic-profile. Thanks!
+# This script is called by profile.py with a list of directories to export
+# as arguments (e.g., ./nfs-server.sh /nfs/tpch /nfs/starrocks)
 #
-# Hacked by mike to work on FreeBSD. The whole strategy has been changed
-# however. Rather than insert commands/variables into the standard system
-# files to have every thing restart on reboot via the standard mechanisms,
-# we handle all the startup from this script. This is because the standard
-# mechanisms run well before the Emulab scripts have configured the
-# experimental LAN we are serving files on. On the other hand, this script
-# runs at the end of the Emulab scripts. I do not know how the old method
-# worked even on Linux when there was a reboot!
-#
-. /etc/emulab/paths.sh
 
-OS=$(uname -s)
-HOSTNAME=$(hostname -s)
+# Source Emulab paths
+if [ -f /etc/emulab/paths.sh ]; then
+    . /etc/emulab/paths.sh
+fi
 
-#
-# The storage partition is mounted on /nfs, if you change this, you
-# must change profile.py also.
-#
-NFSDIR="/nfs"
-
-#
-# The name of the nfs network. If you change this, you must change
-# profile.py also.
-#
+# The name of the NFS network (Must match profile.py)
 NFSNETNAME="nfsLan"
 
-#
-# The name of the "prepare" for image snapshot hook.
-#
-HOOKNAME="$BINDIR/prepare.pre.d/nfs-server.sh"
+# Ensure we have arguments
+if [ $# -eq 0 ]; then
+    echo "No NFS directories provided to export. Exiting."
+    exit 0
+fi
 
+# 1. Update /etc/hosts to ensure we can resolve the NFS LAN IP
 if ! (grep -q $HOSTNAME-$NFSNETNAME /etc/hosts); then
-    echo "$HOSTNAME-$NFSNETNAME is not in /etc/hosts"
-    exit 1
+    echo "WARNING: $HOSTNAME-$NFSNETNAME is not in /etc/hosts"
 fi
 
-#
-# On Linux, see if the packages are installed
-#
-if [ "$OS" = "Linux" ]; then
-    # === Software dependencies that need to be installed. ===
-    apt-get update
-    stat=`dpkg-query -W -f '${DB:Status-Status}\n' nfs-kernel-server`
-    if [ "$stat" = "not-installed" ]; then
-	echo ""
-	echo "Installing NFS packages"
-	apt-get --assume-yes install nfs-kernel-server nfs-common
-	# make sure the server is not running til we fix up exports
-	service nfs-kernel-server stop
+# 2. Install NFS Server (Ubuntu/Debian)
+apt-get update
+if ! dpkg -s nfs-kernel-server >/dev/null 2>&1; then
+    echo "Installing NFS Server..."
+    apt-get --assume-yes install nfs-kernel-server nfs-common
+    service nfs-kernel-server stop
+fi
+
+# 3. Calculate the Subnet
+# We grab the IP of this node on the NFS LAN and assume a /24 subnet.
+NFSIP=`grep -i $HOSTNAME-$NFSNETNAME /etc/hosts | awk '{print $1}'`
+# Extract first 3 octets: 10.10.10.5 -> 10.10.10.0
+NFSNET=`echo $NFSIP | awk -F. '{printf "%s.%s.%s.0", $1, $2, $3}'`
+
+echo "NFS IP: $NFSIP"
+echo "NFS Subnet: $NFSNET/24"
+
+# 4. Configure /etc/exports
+# Loop through ALL arguments passed to the script ($@)
+for EXPORT_DIR in "$@"
+do
+    echo "Processing export: $EXPORT_DIR"
+
+    # Create the directory if it doesn't exist
+    # (CloudLab usually mounts the blockstore here, but we ensure it exists)
+    if [ ! -d "$EXPORT_DIR" ]; then
+        mkdir -p -m 755 "$EXPORT_DIR"
+        chown nobody:nogroup "$EXPORT_DIR"
     fi
-fi
 
-#
-# If exports entry already exists, no need to do anything. 
-#
-if ! grep -q "^$NFSDIR" /etc/exports; then
-    # Will be owned by root/wheel, you will have to use sudo on the clients
-    # to make sub directories and protect them accordingly.
-    mkdir -p -m 755 $NFSDIR
-
-    echo ""
-    echo "Setting up NFS exports"
-    #
-    # Export the NFS server directory to the subnet so that all clients
-    # can mount it.  To do that, we need the subnet. Grab that from
-    # /etc/hosts, and assume a netmask of 255.255.255.0, which will be
-    # fine 99.9% of the time.
-    #
-    NFSIP=`grep -i $HOSTNAME-$NFSNETNAME /etc/hosts | awk '{print $1}'`
-    NFSNET=`echo $NFSIP | awk -F. '{printf "%s.%s.%s.0", $1, $2, $3}'`
-
-    if [ "$OS" = "Linux" ]; then
-	echo "$NFSDIR $NFSNET/24(rw,sync,no_root_squash,no_subtree_check,fsid=0)" >> /etc/exports
+    # Check if already exported to avoid duplicates
+    if ! grep -q "^$EXPORT_DIR" /etc/exports; then
+        echo "Exporting $EXPORT_DIR to $NFSNET/24"
+        # rw = read/write, no_root_squash = allow root on client to be root on server
+        echo "$EXPORT_DIR $NFSNET/24(rw,sync,no_root_squash,no_subtree_check,fsid=0)" >> /etc/exports
     else
-	echo "$NFSDIR -network $NFSNET -mask 255.255.255.0 -maproot=root -alldirs" >> /etc/exports
+        echo "$EXPORT_DIR is already in /etc/exports"
     fi
+done
 
-    if [ "$OS" = "Linux" ]; then
-	# Make sure we start RPCbind to listen on the right interfaces.
-	echo "OPTIONS=\"-l -h 127.0.0.1 -h $NFSIP\"" > /etc/default/rpcbind
+# 5. Configure RPC Bind (Security / Binding)
+echo "OPTIONS=\"-l -h 127.0.0.1 -h $NFSIP\"" > /etc/default/rpcbind
+sed -i.bak -e "s/^rpcbind/#rpcbind/" /etc/hosts.deny
 
-	# We want to allow rpcinfo to operate from the clients.
-	sed -i.bak -e "s/^rpcbind/#rpcbind/" /etc/hosts.deny
-    else
-	# On FreeBSD we will start all the services manually
-	# But make sure the options are correct
-	cp -p /etc/rc.conf /etc/rc.conf.bak
-	cat <<EOF >> /etc/rc.conf
-rpcbind_enable="NO"
-rpcbind_flags="-h $NFSIP"
-rpc_lockd_enable="NO"
-rpc_lockd_flags="-h $NFSIP"
-rpc_statd_enable="NO"
-rpc_statd_flags="-h $NFSIP"
-mountd_enable="NO"
-mountd_flags="-h $NFSIP"
-nfs_server_enable="NO"
-nfs_server_flags="-u -t -h $NFSIP"
-nfs_reserved_port_only="YES"
-EOF
-    fi
-fi
+# 6. Restart Services
+echo "Restarting RPC and NFS services..."
+service rpcbind stop
+sleep 1
+service rpcbind start
+service nfs-kernel-server start
 
-#
-# Create prepare hook to remove our customizations before we take the
-# image snapshot. They will get reinstalled at reboot after image snapshot.
-# Remove the hook script too, we do not want it in the new image, and
-# it will get recreated as well at reboot. 
-#
-if [ ! -e $HOOKNAME ]; then
-    if [ "$OS" = "Linux" ]; then
-	cat <<EOFL > $HOOKNAME
-sed -i.bak -e '/^\\$NFSDIR/d' /etc/exports
-sed -i.bak -e "s/^#rpcbind/rpcbind/" /etc/hosts.deny
-echo "OPTIONS=\"-l -h 127.0.0.1\"" > /etc/default/rpcbind
-rm -f $HOOKNAME
-exit 0
-EOFL
-    else
-	cat <<EOFB > $HOOKNAME
-sed -i.bak -e '/^\\$NFSDIR/d' /etc/exports
-# stopping services when making a snapshot might not be a
-# good idea; i.e., if one of the services hangs
-/etc/rc.d/lockd onestop
-/etc/rc.d/statd onestop
-/etc/rc.d/nfsd onestop
-/etc/rc.d/mountd onestop
-/etc/rc.d/rpcbind onestop
-cp -p /etc/rc.conf.bak /etc/rc.conf
-rm -f $HOOKNAME
-exit 0
-EOFB
-    fi
-fi
-chmod +x $HOOKNAME
+# Export explicitly to be safe
+exportfs -a
 
-echo ""
-
-if [ "$OS" = "Linux" ]; then
-    echo "Restarting rpcbind"
-    service rpcbind stop
-    sleep 1
-    service rpcbind start
-    sleep 1
-fi
-
-echo "Starting NFS services"
-if [ "$OS" = "Linux" ]; then
-    service nfs-kernel-server start
-else
-    # nfsd starts rpcbind and mountd
-    /etc/rc.d/nfsd onestart
-    /etc/rc.d/statd onestart
-    /etc/rc.d/lockd onestart
-fi
-
-# Give it time to start-up
-sleep 5
-
+echo "NFS Server Setup Complete."

@@ -1,113 +1,78 @@
-#!/bin/sh
+#!/bin/bash
 #
-# Setup NFS client and mount server.
+# Setup NFS client and mount multiple directories.
 #
-# This script is derived from Jonathan Ellithorpe's Cloudlab profile at
-# https://github.com/jdellithorpe/cloudlab-generic-profile. Thanks!
+# This script is called by profile.py with a list of directories to mount
+# as arguments (e.g., ./nfs-client.sh /nfs/tpch /nfs/starrocks)
 #
-# Hacked by mike to work on FreeBSD. The whole strategy has been changed
-# however. Rather than insert commands/variables into the standard system
-# files to have every thing restart on reboot via the standard mechanisms,
-# we handle all the startup from this script. This is because the standard
-# mechanisms run well before the Emulab scripts have configured the
-# experimental LAN we are serving files on. On the other hand, this script
-# runs at the end of the Emulab scripts. I do not know how the old method
-# worked even on Linux when there was a reboot!
-#
-. /etc/emulab/paths.sh
 
-OS=$(uname -s)
-HOSTNAME=$(hostname -s)
-
-#
-# The storage partition is mounted on /nfs, if you change this, you
-# must change profile.py also.
-#
-NFSDIR="/nfs"
-
-#
-# The name of the nfs server. If you change these, you have to
-# change profile.py also.
-#
-NFSNETNAME="nfsLan"
-NFSSERVER="nfs-$NFSNETNAME"
-
-#
-# The name of the "prepare" for image snapshot hook.
-#
-HOOKNAME="$BINDIR/prepare.pre.d/nfs-client.sh"
-
-if ! (grep -q $NFSSERVER /etc/hosts); then
-    echo "$NFSSERVER is not in /etc/hosts"
-    exit 1
+# Source Emulab paths
+if [ -f /etc/emulab/paths.sh ]; then
+    . /etc/emulab/paths.sh
 fi
 
-#
-# On Linux, see if the packages are installed
-#
-if [ "$OS" = "Linux" ]; then
-    # === Software dependencies that need to be installed. ===
-    apt-get update
-    stat=`dpkg-query -W -f '${DB:Status-Status}\n' nfs-common`
-    if [ "$stat" = "not-installed" ]; then
-	echo ""
-	echo "Installing NFS packages"
-	apt-get --assume-yes install nfs-common
-    fi
+# The name of the NFS network (Must match profile.py)
+NFSSERVER="ide-lan-primary"
+
+# Ensure we have arguments
+if [ $# -eq 0 ]; then
+    echo "No NFS directories provided to mount. Exiting."
+    exit 0
 fi
 
-# Wait until nfs is properly set up. 
-while ! (rpcinfo -s $NFSSERVER | grep -q nfs); do
-    echo ""
-    echo "Waiting for NFS server $NFSSERVER ..."
+# 1. Install NFS Client (Ubuntu/Debian)
+apt-get update
+if ! dpkg -s nfs-common >/dev/null 2>&1; then
+    echo "Installing NFS Common..."
+    apt-get --assume-yes install nfs-common
+fi
+
+# 2. Wait for NFS Server to be reachable
+echo "Waiting for NFS server ($NFSSERVER) to be reachable..."
+while ! ping -c 1 -W 1 $NFSSERVER > /dev/null; do
+    echo "Waiting for ping response from $NFSSERVER..."
     sleep 2
 done
 
-# Create the local mount directory.
-if [ ! -e $NFSDIR ]; then
-    mkdir -p -m 755 $NFSDIR
-fi
+# 3. Wait for NFS RPC service
+while ! (rpcinfo -s $NFSSERVER | grep -q nfs); do
+    echo "Waiting for RPC/NFS on $NFSSERVER ..."
+    sleep 2
+done
 
-mntopts=
-if [ "$OS" = "Linux" ]; then
-    mntopts="rw,bg,sync,hard,intr"
-else
-    mntopts="nfsv3,tcp,rw,bg,hard,intr"
-fi
+# 4. Mount Loop
+# Standard mount options for performance/reliability
+MNTOPTS="rw,bg,sync,hard,intr"
 
-#
-# Run the mount. It is a background mount, so will keep trying until
-# the server is up, which it already should be, 
-#
-echo ""
-echo "Mounting $NFSSERVER:$NFSDIR ..."
-if ! mount -t nfs -o $mntopts $NFSSERVER:$NFSDIR $NFSDIR; then
-    echo 'WARNING: Background mount failed?! Trying again in 5 seconds ...'
-    sleep 5
-    if ! mount -t nfs -o $mntopts $NFSSERVER:$NFSDIR $NFSDIR; then
-	echo 'FATAL: Background mount failed?! Giving up.'
-	exit 1
+# Loop through ALL arguments passed to the script ($@)
+for MOUNT_DIR in "$@"
+do
+    echo "Processing mount: $MOUNT_DIR"
+
+    # Create the local mount point
+    if [ ! -d "$MOUNT_DIR" ]; then
+        echo "Creating local mount point: $MOUNT_DIR"
+        mkdir -p -m 755 "$MOUNT_DIR"
     fi
-fi
 
-#
-# But do not exit until the mount is made, in case there is another
-# script after this one, that depends on the mount really being there.
-#
-if [ "$OS" = "Linux" ]; then
-    while ! (findmnt $NFSDIR); do
-	echo "Waiting for NFS mount of $NFSDIR ..."
-	sleep 2
-    done
-else
-    while ! mount | grep -q "^$NFSSERVER:$NFSDIR"; do
-	echo "Waiting for NFS mount of $NFSDIR ..."
-	sleep 2
-    done
-fi
+    # Check if already mounted
+    if grep -qs "$MOUNT_DIR" /proc/mounts; then
+        echo "$MOUNT_DIR is already mounted."
+    else
+        echo "Mounting $NFSSERVER:$MOUNT_DIR to $MOUNT_DIR ..."
+        
+        # Try to mount
+        if ! mount -t nfs -o $MNTOPTS $NFSSERVER:$MOUNT_DIR $MOUNT_DIR; then
+            echo "WARNING: First mount attempt failed. Retrying in 5 seconds..."
+            sleep 5
+            if ! mount -t nfs -o $MNTOPTS $NFSSERVER:$MOUNT_DIR $MOUNT_DIR; then
+                echo "FATAL: Could not mount $MOUNT_DIR"
+                # We do not exit here, so we can try mounting the other directories
+            fi
+        else
+            echo "Successfully mounted $MOUNT_DIR"
+        fi
+    fi
+done
 
-echo ""
-echo "Mount of $NFSSERVER:$NFSDIR is ready."
-exit 0
-
-
+echo "NFS Client Setup Complete."
