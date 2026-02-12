@@ -1,9 +1,9 @@
 """
-Universal StarRocks Profile v9 (IDE as NFS Server)
+Universal StarRocks Profile v11 (Multiplexing Fix)
 Features:
-- CSV Input for Datasets (URNs and Paths)
-- IDE Node acts as NFS Server
-- All other nodes mount NFS from IDE
+- IDE Node as NFS Server
+- Multiplexing Enabled on LANs (Fixes "Mapping Failed" error)
+- CSV Dataset Inputs
 """
 
 import geni.portal as portal
@@ -27,12 +27,12 @@ pc.defineParameter(
     portal.ParameterType.STRING,
     "d7525",
     [
-        ("d7525", "Wisconsin d7525 (Single Link Limit)"),
-        ("c6525-100g", "Utah c6525-100g (Dual Link Capable)"),
-        ("c6525-25g", "Utah c6525-25g (Dual Link Capable)"),
-        ("m510", "Utah m510 (Single Link Limit)"),
-        ("xl170", "Utah xl170 (Dual Link Capable)"),
-        ("r6525", "Clemson r6526 (Dual Link Capable)"),
+        ("d7525", "Wisconsin d7525"),
+        ("c6525-100g", "Utah c6525-100g"),
+        ("c6525-25g", "Utah c6525-25g"),
+        ("m510", "Utah m510"),
+        ("xl170", "Utah xl170"),
+        ("r6525", "Clemson r6526"),
     ],
 )
 
@@ -75,7 +75,7 @@ pc.defineParameter(
 )
 
 # =============================================================
-# 2. DATASET PARAMETERS
+# 2. DATASET PARAMETERS (CSV)
 # =============================================================
 
 pc.defineParameter(
@@ -98,7 +98,7 @@ params = pc.bindParameters()
 request = pc.makeRequestRSpec()
 
 # =============================================================
-# 3. PARSE CSV INPUTS
+# 3. PARSE CSV & PREPARE SCRIPTS
 # =============================================================
 
 urn_list = (
@@ -116,7 +116,7 @@ if len(urn_list) != len(path_list):
 
 active_datasets = list(zip(urn_list, path_list))
 
-# Generate Argument Strings for Scripts
+# Generate script arguments
 path_args = ""
 for i, (urn, mount) in enumerate(active_datasets):
     path_args += " " + mount
@@ -125,23 +125,34 @@ server_cmd = "sudo /bin/bash /local/repository/nfs-server.sh" + path_args
 client_cmd = "sudo /bin/bash /local/repository/nfs-client.sh" + path_args
 
 # =============================================================
-# 4. NETWORK SETUP
+# 4. NETWORK SETUP (WITH MULTIPLEXING)
 # =============================================================
 
+# Primary LAN
 lan1 = request.LAN("lan-primary")
 lan1.bandwidth = params.speedLan1 * 1000000
+# CRITICAL: These flags allow the LAN to share the physical port with the Datasets
+lan1.link_multiplexing = True
+lan1.vlan_tagging = True
+lan1.best_effort = True
 
+# Logic to force single link if hardware doesn't support 2
 single_port_hardware = ["d7525", "m510"]
 actual_link_count = params.linkCount
 if params.phystype in single_port_hardware and params.linkCount > 1:
     actual_link_count = 1
 
+# Secondary LAN
 if actual_link_count == 2:
     lan2 = request.LAN("lan-secondary")
     lan2.bandwidth = params.speedLan2 * 1000000
+    # Enable multiplexing here too, just in case
+    lan2.link_multiplexing = True
+    lan2.vlan_tagging = True
+    lan2.best_effort = True
 
 # =============================================================
-# 5. IDE NODE (NFS SERVER) CONFIGURATION
+# 5. IDE NODE (NFS SERVER)
 # =============================================================
 
 ide = request.RawPC("ide")
@@ -149,14 +160,13 @@ ide.hardware_type = params.phystype
 ide.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops:UBUNTU24-64-STD"
 
 # -- IDE Networking --
-# Primary Interface (Server IP will be 10.{speed}.0.200)
+# We assign IP .200 to the IDE node
 ide_if1 = ide.addInterface("if1")
 ide_if1.addAddress(
     pg.IPv4Address("10.{}.0.200".format(params.speedLan1), "255.255.255.0")
 )
 lan1.addInterface(ide_if1)
 
-# Secondary Interface (Optional)
 if actual_link_count == 2:
     ide_if2 = ide.addInterface("if2")
     ide_if2.addAddress(
@@ -165,23 +175,25 @@ if actual_link_count == 2:
     lan2.addInterface(ide_if2)
 
 # -- Attach Datasets to IDE --
+# We use the exact link settings from the example script
 for i, (urn, mount) in enumerate(active_datasets):
     dsnode = request.RemoteBlockstore("dsnode-{}".format(i), mount)
     dsnode.dataset = urn
 
-    # Dedicated link for the blockstore to the IDE node
     dslink = request.Link("dslink-{}".format(i))
     dslink.addInterface(dsnode.interface)
     dslink.addInterface(ide.addInterface())
+
+    # Flags required to share the port with LAN1
     dslink.best_effort = True
     dslink.vlan_tagging = True
     dslink.link_multiplexing = True
 
-# -- Run NFS Server Script on IDE --
+# Start NFS Server
 ide.addService(pg.Execute(shell="bash", command=server_cmd))
 
 # =============================================================
-# 6. CLIENT NODES (FE & BACKENDS)
+# 6. CLIENT NODES
 # =============================================================
 
 
@@ -196,21 +208,19 @@ def configure_client_node(name, ip_suffix):
     if1.addAddress(pg.IPv4Address(ip_str_1, "255.255.255.0"))
     lan1.addInterface(if1)
 
-    # --- Interface 2 (Conditional) ---
+    # --- Interface 2 ---
     if actual_link_count == 2:
         if2 = node.addInterface("if2")
         ip_str_2 = "10.{}.0.{}".format(params.speedLan2, ip_suffix)
         if2.addAddress(pg.IPv4Address(ip_str_2, "255.255.255.0"))
         lan2.addInterface(if2)
 
-    # --- Run NFS Client Script ---
+    # Start NFS Client
     node.addService(pg.Execute(shell="bash", command=client_cmd))
 
 
-# Instantiate Frontend (ID = 100)
+# Instantiate
 configure_client_node("fe", 100)
-
-# Instantiate Backend Nodes (ID = 1, 2, 3...)
 for i in range(params.nodeCount):
     configure_client_node("be-{}".format(i), i + 1)
 
